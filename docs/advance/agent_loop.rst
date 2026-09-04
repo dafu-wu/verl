@@ -82,38 +82,80 @@ single-output contract.
        loss_weight: Optional[float] = None
        """Optional positive multiplier for this output's policy-gradient loss."""
 
-``loss_weight`` is optional and defaults to neutral ``1.0``. It is an explicit
-positive policy-gradient multiplier that the rollout adapters pass through
-unchanged; padding rows with no valid response tokens are zeroed. The weight is
-applied only to the policy-gradient term; it does not modify critic returns,
-entropy regularization, or KL regularization.
+``loss_weight`` is optional and defaults to neutral ``1.0``. It is a **relative**
+per-sample multiplier: the rollout adapters pass it through unchanged, the trainer
+validates it (finite, positive; padding rows with no valid response tokens are
+zeroed) and then rescales the weights of each training batch to mean ``1.0`` over
+rows, once, over the global batch (``verl.utils.trajectory.normalize_loss_weight_global``).
+Rescaling preserves every ratio ``w_i / w_j``. A batch whose weights are already
+all equal is returned bit-identical, so single-output loops are unaffected. Because
+of this rescaling ``loss_weight`` is not suitable for carrying an absolute scale
+(e.g. an importance ratio); use it to express *how much of the batch* a sample
+should account for.
+
+The (rescaled) weight is applied to every per-sample term of the actor loss --
+policy gradient, entropy bonus and KL penalty alike -- so that down-weighting a
+row reduces its KL and entropy pressure by the same factor as its policy
+gradient. Weighting only the policy-gradient term would leave a multi-row
+trajectory under ``N`` times the KL and entropy pressure of a single-row one.
+Critic value targets are not weighted. A consequence worth knowing when tuning
+``entropy_coeff`` is that down-weighted rows contribute proportionally less
+entropy pressure per token than they would unweighted.
+
+**Two different objectives, two different weights.** A multi-output trajectory can
+mean two things, and they call for different weights under ``seq-mean-token-mean``
+(the mode that normalizes by *row* count and is therefore sensitive to how many
+rows a trajectory produces):
+
+.. list-table::
+   :header-rows: 1
+
+   * - Objective
+     - When
+     - ``loss_weight`` for row ``j`` of an ``N``-row trajectory
+   * - **session-equal** -- every logical trajectory counts once, regardless of how many
+       rows it produced
+     - Gateway sessions that materialise several branches; equal-credit segments
+     - ``1 / N``
+   * - **partition-preserving** -- the loss equals what the *unsplit* trajectory would
+       have produced
+     - one long episode cut into context-bounded segments of unequal length
+     - ``T_j / mean_k(T_k)`` where ``T_j`` is the number of trainable (``response_mask``)
+       tokens in row ``j``
+
+``1 / N`` is *not* partition-preserving unless the segments have equal token
+counts: for a 1000-token episode cut 100 / 900 with per-token losses 0.2 / 0.8,
+the unsplit ``seq-mean-token-mean`` loss is 0.74, ``1 / N`` gives 0.50, and
+``T_j / mean(T)`` gives 0.74. Pick the objective first, then the weight.
+
+Under ``token-mean``, ``token-sum`` and ``seq-mean-token-sum`` the aggregation
+normalizes by tokens (or not at all), so splitting a trajectory is already
+partition-preserving with ``loss_weight = 1.0``; a weight is only needed there
+if the *session-equal* objective is wanted.
 
 .. warning::
-   The weight needed to make a split trajectory equivalent to an unsplit one
-   depends on ``actor.loss_agg_mode``, because each mode normalizes by a
-   different quantity. Splitting preserves the token count but multiplies the
-   row count by ``N``:
+   The right weight depends on ``actor.loss_agg_mode``, which the rollout adapter
+   does not know. verl therefore defaults every output to ``1.0`` rather than
+   guessing ``1 / N`` -- under the default ``token-mean`` mode a ``1 / N`` default
+   would silently shrink the trajectory's gradient contribution by a factor of
+   ``N``. When a multi-output loop stores rows without an explicit weight, the V1
+   adapter logs a warning once per row count so the choice stays visible. If the
+   agent loop hard-codes a weight and ``loss_agg_mode`` is later changed, the
+   objective changes silently; deriving the weight in the trainer from a declared
+   weighting mode is a planned follow-up.
 
-   .. list-table::
-      :header-rows: 1
-
-      * - ``loss_agg_mode``
-        - Normalizes by
-        - Weight for an N-segment trajectory
-      * - ``token-mean`` (default), ``token-sum``, ``seq-mean-token-sum``
-        - tokens
-        - ``1.0`` (splitting is already neutral)
-      * - ``seq-mean-token-mean``
-        - rows
-        - ``1.0 / N``
-
-   verl therefore defaults every segment to ``1.0`` rather than guessing
-   ``1 / N``: under the default ``token-mean`` mode a ``1 / N`` default would
-   silently shrink the trajectory's gradient contribution by a factor of ``N``.
-   When a multi-output loop stores segments without an explicit weight, the V1
-   adapter logs a warning once per segment count so the choice stays visible.
-   If you train with ``seq-mean-token-mean``, set ``loss_weight = 1 / N``
-   explicitly on each segment.
+.. note::
+   **What the mean-1.0 rescaling does and does not guarantee.** Raw ``1 / N``
+   weights shrink the whole loss by ``mean(w)`` and that factor drifts with each
+   step's mix of long and short trajectories -- a silent, drifting learning-rate
+   change. Rescaling to ``mean_rows(w) = 1`` removes it exactly for aggregation
+   modes that normalize by rows (``seq-mean-token-mean``). For token-normalized
+   modes (``token-mean``) the effective scale is the *token-weighted* mean of
+   ``w``, which equals 1 only when ``w`` is uncorrelated with row length; a batch
+   of ``{100 tokens, w=2}`` + ``{1000 tokens, w=0.5}`` has ``mean_rows(w) = 1``
+   but scales the ``token-mean`` loss by 0.51. The rescaling is still packing-
+   and mix-invariant in every mode -- it just does not promise an unchanged
+   magnitude outside row-normalized aggregation.
 
 Each list element is stored as an independent training row. Consequently,
 ``ppo_mini_batch_size`` continues to count stored rows, not logical

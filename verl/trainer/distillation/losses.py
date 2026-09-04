@@ -278,6 +278,9 @@ def distillation_loss(
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)
         rollout_is_weights = data.get("rollout_is_weights", None)
+        # Weights arrive already rescaled to mean 1.0 over the global batch
+        # (normalize_loss_weight_global in the trainer), so this micro-batch
+        # level must not renormalize.
         distillation_advantages = apply_loss_weight_to_advantages(
             -distillation_losses.detach(), data.get(LOSS_WEIGHT_KEY, None)
         )

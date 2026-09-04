@@ -62,7 +62,9 @@ def _warn_unweighted_multi_output_once(num_outputs: int) -> None:
       count (or not at all). Splitting keeps the token count identical, so
       neutral weight 1.0 already preserves the trajectory's total contribution.
     - ``seq-mean-token-mean`` normalizes by *row* count, which splitting inflates
-      from 1 to N. That mode needs ``loss_weight = 1 / N`` to stay invariant.
+      from 1 to N. That mode needs an explicit weight: ``1 / N`` for a
+      session-equal objective (every logical trajectory counts once) or
+      ``T_j / mean(T)`` to reproduce the unsplit trajectory's loss.
 
     Defaulting to 1.0 is therefore the behavior-preserving choice for the default
     ``token-mean`` mode; only flag the case the adapter cannot decide on its own.
@@ -71,8 +73,9 @@ def _warn_unweighted_multi_output_once(num_outputs: int) -> None:
         "Agent loop returned %d outputs without an explicit %s; each segment defaults to neutral "
         "weight 1.0. This preserves the trajectory's total policy-gradient contribution for "
         "loss_agg_mode in {token-mean, token-sum, seq-mean-token-sum}. If you train with "
-        "seq-mean-token-mean, set AgentLoopOutput.loss_weight = 1/%d explicitly, otherwise this "
-        "trajectory contributes %dx a single-output one.",
+        "seq-mean-token-mean, set AgentLoopOutput.loss_weight explicitly (1/%d for session-equal, "
+        "T_j/mean(T) for partition-preserving), otherwise this trajectory contributes %dx a "
+        "single-output one.",
         num_outputs,
         LOSS_WEIGHT_KEY,
         num_outputs,

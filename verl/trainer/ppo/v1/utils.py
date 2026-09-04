@@ -64,6 +64,7 @@ class MetricsAggregator:
             "weighted_avg": [
                 "training/actor/mini_batches_per_epoch",
                 "training/trajectory/segments_per_session/mean",
+                "training/trajectory/score_mean",
                 "training/trajectory/loss_weight/mean",
             ],
             "min": ["training/trajectory/loss_weight/min"],

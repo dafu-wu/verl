@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import json
 import logging
 import math
@@ -86,7 +87,12 @@ from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import DapoFilteredRewardTableLogger, Tracking, ValidationGenerationsLogger
-from verl.utils.trajectory import LOSS_WEIGHT_KEY, validate_loss_weights
+from verl.utils.trajectory import (
+    LOSS_WEIGHT_KEY,
+    final_row_per_session,
+    normalize_loss_weight_global,
+    validate_loss_weights,
+)
 from verl.workers.config import CriticConfig, DistillationConfig, HFModelConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
@@ -101,6 +107,20 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
 
 
 logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def _warn_missing_loss_weight_once() -> None:
+    """Warn once, not per batch: during a rolling upgrade every batch may hit this."""
+    logger.warning(
+        "%s missing from a training batch; falling back to neutral weight 1.0 for the whole batch. "
+        "TransferQueue only returns a field when every requested row carries it, so one legacy row "
+        "(written before loss weights existed) flattens the real weights of the new rows. Expected only "
+        "while draining pre-upgrade trajectories; further occurrences are not logged.",
+        LOSS_WEIGHT_KEY,
+    )
+
+
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
@@ -1786,17 +1806,35 @@ class PPOTrainer(ABC):
             # row carries it, so a single legacy row makes the whole batch fall back to
             # neutral weights and discards the real weights on the new rows. Warn so that
             # this shows up during a rolling upgrade instead of silently flattening them.
-            logger.warning(
-                "%s missing for batch of %d rows; falling back to neutral weight 1.0 for all of them. "
-                "This is expected only while draining trajectories generated before loss weights existed.",
-                LOSS_WEIGHT_KEY,
-                data.batch["response_mask"].shape[0],
-            )
+            _warn_missing_loss_weight_once()
             data.batch[LOSS_WEIGHT_KEY] = torch.ones(
                 data.batch["response_mask"].shape[0], dtype=torch.float32, device=data.batch["response_mask"].device
             )
         valid_row_mask = data.batch["response_mask"].any(dim=1)
         data.batch[LOSS_WEIGHT_KEY] = validate_loss_weights(data.batch[LOSS_WEIGHT_KEY], valid_mask=valid_row_mask)
+        # Rescale to mean 1.0 over the GLOBAL batch, exactly once, here.
+        #
+        # WHY HERE AND NOT IN ppo_loss(). Raw 1/N weights fix which trajectory
+        # dominates the gradient but also shrink the total loss, because every
+        # loss_agg_mode divides by an unweighted denominator -- MEASURED at 18%
+        # of the unweighted magnitude on a 10-deep + 1-shallow batch, i.e. a
+        # silent 5.5x learning-rate cut that drifts with each step's mix.
+        #
+        # Normalizing inside ppo_loss() would fix the magnitude but DESTROY the
+        # reweighting, because ppo_loss() sees one micro-batch at a time. If a
+        # micro-batch happens to hold only same-weight samples, local mean-1
+        # rescaling turns every weight into 1.0. MEASURED on 10 deep + 1
+        # shallow, where the deep trajectory must end up at 50%:
+        #     all deep in one micro-batch -> 90.9%   (weight erased)
+        #     interleaved                 -> 83.5%
+        # i.e. the objective would depend on how the batcher happened to pack
+        # the samples. Normalizing over the global batch is packing-invariant.
+        #
+        # Trainers that weight per-sample losses after aggregation can divide by
+        # the weighted denominator instead. verl aggregates inside the loss
+        # function, so the equivalent is to normalize the weights themselves,
+        # once, globally.
+        data.batch[LOSS_WEIGHT_KEY] = normalize_loss_weight_global(data.batch[LOSS_WEIGHT_KEY], valid_row_mask)
         valid_loss_weights = data.batch[LOSS_WEIGHT_KEY][valid_row_mask]
         if valid_loss_weights.numel() > 0:
             metrics.update(
@@ -1807,19 +1845,26 @@ class PPOTrainer(ABC):
                 }
             )
 
-        real_keys = [key for key, tag in zip(batch.keys, batch.tags, strict=True) if not tag.get("is_padding", False)]
-        session_keys = set()
-        for key in real_keys:
-            key_parts = key.rsplit("_", 2)
-            session_keys.add("_".join(key_parts[:2]) if len(key_parts) == 3 else key)
-        if session_keys:
-            metrics.update(
-                {
-                    "training/trajectory/expanded_rows": len(real_keys),
-                    "training/trajectory/logical_sessions": len(session_keys),
-                    "training/trajectory/segments_per_session/mean": len(real_keys) / len(session_keys),
-                }
-            )
+        real_positions = [i for i, tag in enumerate(batch.tags) if not tag.get("is_padding", False)]
+        real_keys = [batch.keys[i] for i in real_positions]
+        # final row per logical session, as positions into the full (padded) batch
+        session_final = {
+            session: real_positions[local_pos] for session, local_pos in final_row_per_session(real_keys).items()
+        }
+        if session_final:
+            trajectory_metrics = {
+                "training/trajectory/expanded_rows": len(real_keys),
+                "training/trajectory/logical_sessions": len(session_final),
+                "training/trajectory/segments_per_session/mean": len(real_keys) / len(session_final),
+            }
+            # compute_data_metrics() below sees every stored row, so critic/score/* is a
+            # row-weighted distribution: a trajectory stored as N rows counts N times. Report
+            # the trajectory-level score alongside it -- one value per logical session, taken
+            # from the final row, which is the row the GRPO advantage is computed from.
+            final_positions = torch.tensor(list(session_final.values()), dtype=torch.long)
+            session_scores = data.batch["rm_scores"][final_positions].sum(dim=-1).float()
+            trajectory_metrics["training/trajectory/score_mean"] = session_scores.mean().item()
+            metrics.update(trajectory_metrics)
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
 

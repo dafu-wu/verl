@@ -138,3 +138,26 @@ def test_apply_loss_weight_to_advantages_rejects_advantages_without_token_dim():
     # bogus [batch_size, batch_size] tensor, so it must fail loudly instead.
     with pytest.raises(ValueError, match=r"\[batch_size, response_length\]"):
         apply_loss_weight_to_advantages(torch.tensor([1.0, 2.0]), torch.tensor([0.5, 0.5]))
+
+
+def test_final_row_per_session_picks_highest_index():
+    from verl.utils.trajectory import final_row_per_session
+
+    keys = ["u1_s0_0", "u1_s0_2", "u1_s0_1", "u2_s0_0", "plain-key"]
+    assert final_row_per_session(keys) == {"u1_s0": 1, "u2_s0": 3, "plain-key": 4}
+
+
+def test_final_row_per_session_is_the_trajectory_level_view():
+    """Row-weighted vs trajectory-level mean differ once sessions have unequal row counts."""
+    import torch
+
+    from verl.utils.trajectory import final_row_per_session
+
+    # session A: 1 row, score 1.0 ; session B: 3 rows, score 0.0 (broadcast)
+    keys = ["a_s_0", "b_s_0", "b_s_1", "b_s_2"]
+    scores = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    row_mean = scores.mean().item()
+    final = torch.tensor(list(final_row_per_session(keys).values()))
+    traj_mean = scores[final].mean().item()
+    assert row_mean == 0.25
+    assert traj_mean == 0.5
